@@ -21,6 +21,13 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
         ".docx",
         ".pptx",
         ".xlsx",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tif",
+        ".tiff",
+        ".bmp",
+        ".webp",
     }
 )
 

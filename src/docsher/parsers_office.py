@@ -343,6 +343,24 @@ def _pdf_stream_payload(object_body: bytes) -> bytes:
     return payload
 
 
+def count_pdf_pages(path: str | Path) -> int:
+    """Return a best-effort page count for a PDF without external dependencies."""
+
+    document_path = Path(path)
+    data = document_path.read_bytes()
+    if not data.startswith(b"%PDF"):
+        raise OfficeParseError("Not a PDF file")
+    objects = _parse_pdf_objects(data)
+    page_refs = _pdf_page_refs_in_tree(objects)
+    if page_refs:
+        return len(page_refs)
+    return sum(
+        1
+        for body in objects.values()
+        if re.search(rb"/Type\s*/Page\b", body) and not re.search(rb"/Type\s*/Pages\b", body)
+    )
+
+
 def _parse_pdf(path: Path) -> tuple[ParsedOfficeSegment, ...]:
     data = path.read_bytes()
     if not data.startswith(b"%PDF"):

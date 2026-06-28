@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -9,11 +10,13 @@ from pathlib import Path
 
 from docsher.chunker import TextChunk, chunk_text
 from docsher.db import connect, init_database
+from docsher.ocr import enqueue_ocr_document
 from docsher.parsers_office import (
     PARSER_NAME as OFFICE_PARSER_NAME,
     SUPPORTED_OFFICE_EXTENSIONS,
     OfficeParserError,
     ParsedOfficeSegment,
+    count_pdf_pages,
     parse_office_document,
 )
 from docsher.parsers_text import (
@@ -26,7 +29,12 @@ from docsher.parsers_text import (
 INDEXED_STATUS = "indexed"
 PENDING_STATUS = "pending"
 FAILED_STATUS = "failed"
-SUPPORTED_INDEX_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | SUPPORTED_OFFICE_EXTENSIONS
+SUPPORTED_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"})
+SUPPORTED_INDEX_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | SUPPORTED_OFFICE_EXTENSIONS | SUPPORTED_IMAGE_EXTENSIONS
+
+
+class OCRRequired(Exception):
+    """Raised internally when a pending document should be handled by OCR."""
 
 
 @dataclass(frozen=True)
@@ -36,6 +44,7 @@ class IndexResult:
     parsed_documents: int = 0
     failed_documents: int = 0
     skipped_pending_documents: int = 0
+    queued_ocr_documents: int = 0
     created_chunks: int = 0
 
 
@@ -178,6 +187,45 @@ def _mark_document_failed(
     )
 
 
+def _queue_document_for_ocr(database_path: Path, document: _PendingDocument) -> None:
+    """Queue an image or textless PDF for OCR while leaving it pending for retry visibility."""
+
+    extension = (document.extension or "").lower()
+    if extension == ".pdf":
+        for page_number, image_path in _render_pdf_pages_for_ocr(document):
+            enqueue_ocr_document(
+                database_path,
+                document_id=document.id,
+                input_path=image_path,
+                page_number=page_number,
+            )
+        return
+    enqueue_ocr_document(database_path, document_id=document.id, input_path=document.path)
+
+
+def _render_pdf_pages_for_ocr(document: _PendingDocument) -> tuple[tuple[int, Path], ...]:
+    """Create deterministic per-page image placeholders for OCR backends.
+
+    The stdlib MVP cannot rasterize PDFs itself. It still exposes the correct
+    page-image queue contract by materializing one portable graymap image per
+    detected page. Real OCR backends can replace this renderer with a Poppler or
+    PyMuPDF implementation without changing queue semantics.
+    """
+
+    pdf_path = Path(document.path)
+    page_count = max(count_pdf_pages(pdf_path), 1)
+    digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:16]
+    cache_dir = pdf_path.parent / ".docsher_ocr_cache" / f"{pdf_path.stem}-{digest}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    rendered: list[tuple[int, Path]] = []
+    for page_number in range(1, page_count + 1):
+        image_path = cache_dir / f"page-{page_number:04d}.pgm"
+        if not image_path.exists():
+            image_path.write_bytes(b"P5\n1 1\n255\n\xff")
+        rendered.append((page_number, image_path))
+    return tuple(rendered)
+
+
 def _parse_document(document: _PendingDocument, *, max_text_bytes: int | None) -> tuple[str, tuple[_IndexChunk, ...]]:
     extension = (document.extension or "").lower()
     if extension in SUPPORTED_TEXT_EXTENSIONS:
@@ -189,8 +237,12 @@ def _parse_document(document: _PendingDocument, *, max_text_bytes: int | None) -
     if extension in SUPPORTED_OFFICE_EXTENSIONS:
         parsed = parse_office_document(document.path)
         if not parsed.segments:
+            if extension == ".pdf":
+                raise OCRRequired("PDF has no extractable text layer; OCR required")
             raise OfficeParserError("No extractable office text found")
         return parsed.parser_name, _office_segments_to_index_chunks(parsed.segments)
+    if extension in SUPPORTED_IMAGE_EXTENSIONS:
+        raise OCRRequired("Image document requires OCR")
     raise ValueError(f"Unsupported pending document extension: {extension}")
 
 
@@ -210,6 +262,7 @@ def index_pending_documents(
     parsed_documents = 0
     failed_documents = 0
     skipped_pending_documents = 0
+    queued_ocr_documents = 0
     created_chunks = 0
 
     with connect(resolved_database_path) as connection:
@@ -224,6 +277,11 @@ def index_pending_documents(
         parser_name = OFFICE_PARSER_NAME if extension in SUPPORTED_OFFICE_EXTENSIONS else TEXT_PARSER_NAME
         try:
             parser_name, chunks = _parse_document(document, max_text_bytes=max_text_bytes)
+        except OCRRequired:
+            _queue_document_for_ocr(resolved_database_path, document)
+            queued_ocr_documents += 1
+            skipped_pending_documents += 1
+            continue
         except (OSError, TextParserError, OfficeParserError, ValueError) as exc:
             with connect(resolved_database_path) as connection:
                 with connection:
@@ -257,6 +315,7 @@ def index_pending_documents(
         parsed_documents=parsed_documents,
         failed_documents=failed_documents,
         skipped_pending_documents=skipped_pending_documents,
+        queued_ocr_documents=queued_ocr_documents,
         created_chunks=created_chunks,
     )
 
@@ -279,7 +338,8 @@ def format_index_result(result: IndexResult) -> str:
             "Document indexing:",
             f"Parsed documents: {result.parsed_documents}",
             f"Failed documents: {result.failed_documents}",
-            f"Skipped pending unsupported documents: {result.skipped_pending_documents}",
+            f"Skipped pending unsupported/OCR documents: {result.skipped_pending_documents}",
+            f"Queued OCR documents: {result.queued_ocr_documents}",
             f"Created chunks: {result.created_chunks}",
         ]
     )

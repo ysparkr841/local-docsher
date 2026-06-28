@@ -23,9 +23,12 @@ env/
 *.db
 *.db-*
 *.log
+.docsher_ocr_cache/
+**/.docsher_ocr_cache/
 
 # Local temporary verification fixtures
 .tmp*/
+.hermes-tmp.*/
 tmp/
 temp/
 

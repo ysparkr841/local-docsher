@@ -173,7 +173,49 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=4,
+        name="ocr_jobs_page_inputs",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS ocr_jobs_v4 (
+                id INTEGER PRIMARY KEY,
+                document_id INTEGER NOT NULL,
+                backend TEXT NOT NULL DEFAULT 'default',
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                result_text TEXT,
+                input_path TEXT,
+                page_number INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+                UNIQUE(document_id, backend, page_number)
+            )
+            """,
+            """
+            INSERT OR IGNORE INTO ocr_jobs_v4(
+                id, document_id, backend, status, attempts, error_message,
+                result_text, input_path, page_number, created_at, updated_at
+            )
+            SELECT id, document_id, backend, status, attempts, error_message,
+                result_text, NULL, 0, created_at, updated_at
+            FROM ocr_jobs
+            """,
+            "DROP TABLE IF EXISTS ocr_jobs",
+            "ALTER TABLE ocr_jobs_v4 RENAME TO ocr_jobs",
+            "CREATE INDEX IF NOT EXISTS idx_ocr_jobs_status ON ocr_jobs(status)",
+            "CREATE INDEX IF NOT EXISTS idx_ocr_jobs_document_id ON ocr_jobs(document_id)",
+        ),
+    ),
 )
+
+
+OCR_JOB_COLUMN_DEFINITIONS: dict[str, str] = {
+    "input_path": "TEXT",
+    "page_number": "INTEGER NOT NULL DEFAULT 0",
+}
 
 
 DOCUMENT_COLUMN_DEFINITIONS: dict[str, str] = {
@@ -233,6 +275,8 @@ REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
         "attempts",
         "error_message",
         "result_text",
+        "input_path",
+        "page_number",
         "created_at",
         "updated_at",
     },
@@ -341,6 +385,8 @@ def _repair_current_schema(connection: sqlite3.Connection) -> None:
             connection, "documents", DOCUMENT_COLUMN_DEFINITIONS
         )
         _add_missing_optional_columns(connection, "chunks", CHUNK_COLUMN_DEFINITIONS)
+        if _table_exists(connection, "ocr_jobs"):
+            _add_missing_optional_columns(connection, "ocr_jobs", OCR_JOB_COLUMN_DEFINITIONS)
         _drop_fts_triggers(connection)
         _ensure_chunks_fts_shape(connection)
         _backfill_chunks_fts(connection)

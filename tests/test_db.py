@@ -138,6 +138,7 @@ def test_init_database_is_idempotent(tmp_path: Path) -> None:
         (1, "initial_schema"),
         (2, "lds003_schema_repair_marker"),
         (3, "ocr_jobs_queue"),
+        (4, "ocr_jobs_page_inputs"),
     ]
     assert documents_count == 0
 
@@ -203,6 +204,7 @@ def test_init_database_repairs_stale_v1_schema(tmp_path: Path) -> None:
         (1, "initial_schema"),
         (2, "lds003_schema_repair_marker"),
         (3, "ocr_jobs_queue"),
+        (4, "ocr_jobs_page_inputs"),
     ]
     assert {
         "extension",

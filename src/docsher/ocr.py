@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from docsher.chunker import chunk_text
 from docsher.db import connect, init_database
 
 OCR_STATUS_QUEUED = "queued"
@@ -52,6 +54,8 @@ class OCRJob:
     attempts: int
     error_message: str | None
     result_text: str | None
+    input_path: str | None
+    page_number: int
     created_at: str
     updated_at: str
 
@@ -64,10 +68,18 @@ class FakeOCRBackend:
 
     name = "fake"
 
-    def __init__(self, text: str = "fake OCR text", *, available: bool = True, fail: bool = False) -> None:
+    def __init__(
+        self,
+        text: str = "fake OCR text",
+        *,
+        available: bool = True,
+        fail: bool = False,
+        page_number: int | None = None,
+    ) -> None:
         self.text = text
         self.available = available
         self.fail = fail
+        self.page_number = page_number
 
     def is_available(self) -> bool:
         return self.available
@@ -75,7 +87,56 @@ class FakeOCRBackend:
     def recognize(self, path: str | Path) -> OCRResult:
         if self.fail:
             raise RuntimeError(f"fake OCR failed for {Path(path).name}")
-        return OCRResult(text=self.text, backend=self.name)
+        return OCRResult(text=self.text, backend=self.name, page_number=self.page_number)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _store_ocr_result_chunks(
+    connection: sqlite3.Connection,
+    *,
+    document_id: int,
+    result: OCRResult,
+) -> int:
+    """Replace document chunks with OCR text while preserving OCR page metadata."""
+
+    stored_page_number = result.page_number if result.page_number and result.page_number > 0 else None
+    if stored_page_number is None:
+        connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+    else:
+        connection.execute(
+            "DELETE FROM chunks WHERE document_id = ? AND page_number = ?",
+            (document_id, stored_page_number),
+        )
+    next_index = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(chunk_index) + 1, 0) FROM chunks WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()[0]
+    )
+    text_chunks = chunk_text(result.text)
+    connection.executemany(
+        """
+        INSERT INTO chunks(
+            document_id, chunk_index, text, page_number, sheet_name,
+            slide_number, section_title, token_count
+        )
+        VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?)
+        """,
+        (
+            (
+                document_id,
+                next_index + chunk.chunk_index,
+                chunk.text,
+                stored_page_number,
+                chunk.token_count,
+            )
+            for chunk in text_chunks
+        ),
+    )
+    return len(text_chunks)
 
 
 def _row_to_job(row: sqlite3.Row) -> OCRJob:
@@ -87,6 +148,8 @@ def _row_to_job(row: sqlite3.Row) -> OCRJob:
         attempts=int(row["attempts"]),
         error_message=row["error_message"],
         result_text=row["result_text"],
+        input_path=row["input_path"],
+        page_number=int(row["page_number"]),
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
@@ -97,11 +160,15 @@ def enqueue_ocr_document(
     *,
     document_id: int,
     backend: str | None = None,
+    input_path: str | Path | None = None,
+    page_number: int | None = None,
 ) -> OCRJob:
     """Queue a document for OCR and mark document OCR status as queued."""
 
     resolved_database_path = init_database(database_path)
     backend_name = backend or DEFAULT_OCR_BACKEND
+    queued_input_path = str(Path(input_path).expanduser().resolve(strict=False)) if input_path is not None else None
+    queued_page_number = page_number or 0
     with connect(resolved_database_path) as connection:
         connection.row_factory = sqlite3.Row
         with connection:
@@ -110,23 +177,33 @@ def enqueue_ocr_document(
                 raise ValueError(f"Document not found: {document_id}")
             connection.execute(
                 """
-                INSERT INTO ocr_jobs(document_id, backend, status, attempts, error_message, result_text)
-                VALUES (?, ?, ?, 0, NULL, NULL)
-                ON CONFLICT(document_id, backend) DO UPDATE SET
-                    status = excluded.status,
-                    error_message = NULL,
-                    result_text = NULL,
+                INSERT INTO ocr_jobs(document_id, backend, status, attempts, error_message, result_text, input_path, page_number)
+                VALUES (?, ?, ?, 0, NULL, NULL, ?, ?)
+                ON CONFLICT(document_id, backend, page_number) DO UPDATE SET
+                    status = CASE
+                        WHEN ocr_jobs.status = 'completed' THEN ocr_jobs.status
+                        ELSE excluded.status
+                    END,
+                    input_path = excluded.input_path,
+                    error_message = CASE
+                        WHEN ocr_jobs.status = 'completed' THEN ocr_jobs.error_message
+                        ELSE NULL
+                    END,
+                    result_text = CASE
+                        WHEN ocr_jobs.status = 'completed' THEN ocr_jobs.result_text
+                        ELSE NULL
+                    END,
                     updated_at = datetime('now')
                 """,
-                (document_id, backend_name, OCR_STATUS_QUEUED),
+                (document_id, backend_name, OCR_STATUS_QUEUED, queued_input_path, queued_page_number),
             )
             connection.execute(
                 "UPDATE documents SET ocr_status = ? WHERE id = ?",
                 (OCR_STATUS_QUEUED, document_id),
             )
         row = connection.execute(
-            "SELECT * FROM ocr_jobs WHERE document_id = ? AND backend = ?",
-            (document_id, backend_name),
+            "SELECT * FROM ocr_jobs WHERE document_id = ? AND backend = ? AND page_number = ?",
+            (document_id, backend_name, queued_page_number),
         ).fetchone()
     return _row_to_job(row)
 
@@ -173,7 +250,8 @@ def process_next_ocr_job(database_path: str | Path, backend: OCRBackend) -> OCRJ
 
         job_id = int(row["id"])
         document_id = int(row["document_id"])
-        document_path = str(row["document_path"])
+        document_path = str(row["input_path"] or row["document_path"])
+        queued_page_number = int(row["page_number"])
         attempts = int(row["attempts"]) + 1
         with connection:
             connection.execute(
@@ -189,6 +267,8 @@ def process_next_ocr_job(database_path: str | Path, backend: OCRBackend) -> OCRJ
             if not backend.is_available():
                 raise RuntimeError(f"OCR backend unavailable: {backend.name}")
             result = backend.recognize(document_path)
+            if result.page_number is None and queued_page_number > 0:
+                result = OCRResult(text=result.text, backend=result.backend, page_number=queued_page_number)
         except Exception as exc:  # noqa: BLE001 - backend boundary must isolate failures.
             with connection:
                 connection.execute(
@@ -205,6 +285,7 @@ def process_next_ocr_job(database_path: str | Path, backend: OCRBackend) -> OCRJ
                 )
         else:
             with connection:
+                _store_ocr_result_chunks(connection, document_id=document_id, result=result)
                 connection.execute(
                     """
                     UPDATE ocr_jobs
@@ -213,9 +294,25 @@ def process_next_ocr_job(database_path: str | Path, backend: OCRBackend) -> OCRJ
                     """,
                     (OCR_STATUS_COMPLETED, attempts, result.text, job_id),
                 )
+                remaining_jobs = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM ocr_jobs
+                        WHERE document_id = ? AND id != ? AND status IN (?, ?)
+                        """,
+                        (document_id, job_id, OCR_STATUS_QUEUED, OCR_STATUS_PROCESSING),
+                    ).fetchone()[0]
+                )
+                document_status = 'indexed' if remaining_jobs == 0 else 'pending'
+                document_ocr_status = OCR_STATUS_COMPLETED if remaining_jobs == 0 else OCR_STATUS_QUEUED
                 connection.execute(
-                    "UPDATE documents SET ocr_status = ? WHERE id = ?",
-                    (OCR_STATUS_COMPLETED, document_id),
+                    """
+                    UPDATE documents
+                    SET status = ?, indexed_at = ?, error_message = NULL,
+                        parser_name = ?, ocr_status = ?
+                    WHERE id = ?
+                    """,
+                    (document_status, _utc_now_iso(), f"ocr:{backend.name}", document_ocr_status, document_id),
                 )
 
         final_row = connection.execute("SELECT * FROM ocr_jobs WHERE id = ?", (job_id,)).fetchone()

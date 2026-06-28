@@ -17,7 +17,9 @@ from docsher.config import (
     update_indexing_schedule,
 )
 from docsher.db import init_database
-from docsher.indexer import format_index_result
+from docsher.indexer import SUPPORTED_IMAGE_EXTENSIONS, format_index_result
+from docsher.ocr import FakeOCRBackend
+from docsher.parsers_office import parse_office_document
 from docsher.scanner import format_scan_result, scan
 from docsher.scheduler import run_scheduled_index_once
 from docsher.search import SearchError, format_search_results, search_documents
@@ -164,6 +166,44 @@ def _cmd_search(args: argparse.Namespace) -> int:
 def _cmd_status(args: argparse.Namespace) -> int:
     status = get_index_status(args.database_path)
     print(format_index_status(status, json_output=args.json))
+    return 0
+
+
+def _cmd_ocr_test(args: argparse.Namespace) -> int:
+    document_path = Path(args.path).expanduser().resolve(strict=False)
+    extension = document_path.suffix.lower()
+    if not document_path.exists():
+        print(f"OCR test error: file not found: {document_path}")
+        return 2
+
+    has_text_layer = False
+    extracted_pages: list[int | None] = []
+    if extension == ".pdf":
+        try:
+            parsed = parse_office_document(document_path)
+        except Exception as exc:  # noqa: BLE001 - diagnostic command should return a clear error.
+            print(f"OCR test error: could not inspect PDF: {exc}")
+            return 2
+        has_text_layer = bool(parsed.segments)
+        extracted_pages = [segment.page_number for segment in parsed.segments]
+    elif extension in SUPPORTED_IMAGE_EXTENSIONS:
+        has_text_layer = False
+    else:
+        print(f"OCR test error: unsupported OCR test extension: {extension}")
+        return 2
+
+    ocr_required = extension in SUPPORTED_IMAGE_EXTENSIONS or (extension == ".pdf" and not has_text_layer)
+    payload: dict[str, object] = {
+        "path": str(document_path),
+        "extension": extension,
+        "has_text_layer": has_text_layer,
+        "ocr_required": ocr_required,
+        "text_layer_pages": extracted_pages,
+    }
+    if ocr_required:
+        result = FakeOCRBackend(args.fake_text, page_number=args.page_number).recognize(document_path)
+        payload["fake_ocr"] = result.to_dict()
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
@@ -318,6 +358,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit deterministic machine-readable JSON output.",
     )
     status_parser.set_defaults(func=_cmd_status)
+
+    ocr_test_parser = subparsers.add_parser(
+        "ocr-test",
+        help="Inspect whether a PDF/image needs OCR and run a fake offline OCR smoke test.",
+    )
+    ocr_test_parser.add_argument("path", help="PDF or image file to inspect.")
+    ocr_test_parser.add_argument(
+        "--fake-text",
+        default="fake OCR text",
+        help="Text returned by the deterministic fake OCR backend for smoke testing.",
+    )
+    ocr_test_parser.add_argument(
+        "--page-number",
+        type=int,
+        default=1,
+        help="Page number attached to fake OCR output when OCR is required.",
+    )
+    ocr_test_parser.set_defaults(func=_cmd_ocr_test)
 
     serve_parser = subparsers.add_parser(
         "serve",
