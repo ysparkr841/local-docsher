@@ -13,6 +13,7 @@ from docsher.config import (
     add_root,
     default_user_config_path,
     get_indexing_schedule,
+    get_llm_settings,
     list_roots,
     load_config,
     normalize_root,
@@ -37,6 +38,10 @@ def test_default_config_contains_lds_002_fields(tmp_path: Path, monkeypatch: pyt
     assert config["storage"]["database_path"]
     assert config["llm"]["ollama_endpoint"] == "http://localhost:11434"
     assert config["llm"]["ollama_model"]
+    llm_settings = get_llm_settings(config)
+    assert llm_settings["provider"] == "ollama"
+    assert llm_settings["openai_compatible_endpoint"].endswith("/v1/chat/completions")
+    assert llm_settings["timeout_seconds"] == 60
     assert config["ocr"]["backend"]
 
 

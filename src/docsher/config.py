@@ -40,6 +40,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "provider": "ollama",
         "ollama_endpoint": "http://localhost:11434",
         "ollama_model": "qwen2.5:7b-instruct",
+        "openai_compatible_endpoint": "http://localhost:11434/v1/chat/completions",
+        "openai_compatible_model": "qwen2.5:7b-instruct",
+        "api_key": None,
+        "timeout_seconds": 60,
     },
     "ocr": {
         "enabled": True,
@@ -170,6 +174,34 @@ def get_indexing_schedule(config: dict[str, Any]) -> dict[str, Any]:
         "schedule": str(indexing.get("schedule", defaults["schedule"])),
         "time": str(indexing.get("time", defaults["time"])),
         "incremental": bool(indexing.get("incremental", defaults["incremental"])),
+    }
+
+
+def get_llm_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Return LLM settings with defaults merged in.
+
+    The default shape targets local Ollama while also exposing an
+    OpenAI-compatible endpoint/model pair so offline deployments can point to any
+    local small-model server that implements ``/v1/chat/completions``.
+    """
+
+    llm = config.setdefault("llm", {})
+    defaults = DEFAULT_CONFIG["llm"]
+    provider = str(llm.get("provider", defaults["provider"]))
+    ollama_endpoint = str(llm.get("ollama_endpoint", defaults["ollama_endpoint"])).rstrip("/")
+    openai_endpoint = str(
+        llm.get("openai_compatible_endpoint", defaults["openai_compatible_endpoint"])
+    )
+    return {
+        "provider": provider,
+        "ollama_endpoint": ollama_endpoint,
+        "ollama_model": str(llm.get("ollama_model", defaults["ollama_model"])),
+        "openai_compatible_endpoint": openai_endpoint,
+        "openai_compatible_model": str(
+            llm.get("openai_compatible_model", defaults["openai_compatible_model"])
+        ),
+        "api_key": llm.get("api_key", defaults["api_key"]),
+        "timeout_seconds": int(llm.get("timeout_seconds", defaults["timeout_seconds"])),
     }
 
 
