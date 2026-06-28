@@ -46,6 +46,10 @@ class IndexStatus:
     deleted_count: int
     pending_count: int
     other_count: int
+    ocr_queued_count: int
+    ocr_completed_count: int
+    ocr_failed_count: int
+    ocr_processing_count: int
     last_indexed_at: str | None
     failed_documents: tuple[FailedDocumentStatus, ...]
 
@@ -88,6 +92,18 @@ def get_index_status(database_path: str | Path | None = None) -> IndexStatus:
             """
         ).fetchall()
         status_counts = {str(row["status"]): int(row["count"]) for row in rows}
+        ocr_rows = connection.execute(
+            """
+            SELECT ocr_status, COUNT(*) AS count
+            FROM documents
+            GROUP BY ocr_status
+            """
+        ).fetchall()
+        ocr_status_counts = {
+            str(row["ocr_status"]): int(row["count"])
+            for row in ocr_rows
+            if row["ocr_status"] is not None
+        }
         last_indexed_at = connection.execute(
             """
             SELECT MAX(indexed_at)
@@ -98,10 +114,23 @@ def get_index_status(database_path: str | Path | None = None) -> IndexStatus:
         ).fetchone()[0]
         failed_rows = connection.execute(
             """
-            SELECT id, path, filename, extension, status, error_message, parser_name
+            SELECT
+                documents.id,
+                documents.path,
+                documents.filename,
+                documents.extension,
+                documents.status,
+                COALESCE(documents.error_message, ocr_job_errors.error_message) AS error_message,
+                documents.parser_name
             FROM documents
-            WHERE status = ?
-            ORDER BY path
+            LEFT JOIN (
+                SELECT document_id, MAX(error_message) AS error_message
+                FROM ocr_jobs
+                WHERE status = 'failed'
+                GROUP BY document_id
+            ) AS ocr_job_errors ON ocr_job_errors.document_id = documents.id
+            WHERE documents.status = ? OR documents.ocr_status = 'failed'
+            ORDER BY documents.path
             """,
             (FAILED_STATUS,),
         ).fetchall()
@@ -137,6 +166,10 @@ def get_index_status(database_path: str | Path | None = None) -> IndexStatus:
         deleted_count=deleted_count,
         pending_count=pending_count,
         other_count=total_documents - known_count,
+        ocr_queued_count=ocr_status_counts.get("queued", 0),
+        ocr_completed_count=ocr_status_counts.get("completed", 0),
+        ocr_failed_count=ocr_status_counts.get("failed", 0),
+        ocr_processing_count=ocr_status_counts.get("processing", 0),
         last_indexed_at=str(last_indexed_at) if last_indexed_at is not None else None,
         failed_documents=tuple(failed_documents),
     )
@@ -158,6 +191,10 @@ def format_index_status(status: IndexStatus, *, json_output: bool = False) -> st
         f"Pending documents: {status.pending_count}",
         f"Deleted documents: {status.deleted_count}",
         f"Other status documents: {status.other_count}",
+        f"OCR queued documents: {status.ocr_queued_count}",
+        f"OCR completed documents: {status.ocr_completed_count}",
+        f"OCR failed documents: {status.ocr_failed_count}",
+        f"OCR processing documents: {status.ocr_processing_count}",
         f"Last indexed at: {status.last_indexed_at or 'never'}",
     ]
     if not status.failed_documents:

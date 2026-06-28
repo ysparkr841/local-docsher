@@ -209,6 +209,28 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_ocr_jobs_document_id ON ocr_jobs(document_id)",
         ),
     ),
+    Migration(
+        version=5,
+        name="ocr_result_cache",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS ocr_result_cache (
+                id INTEGER PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                page_number INTEGER NOT NULL DEFAULT 0,
+                result_text TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(content_hash, backend, page_number)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_ocr_result_cache_lookup
+            ON ocr_result_cache(content_hash, backend, page_number)
+            """,
+        ),
+    ),
 )
 
 
@@ -237,6 +259,19 @@ CHUNK_COLUMN_DEFINITIONS: dict[str, str] = {
     "section_title": "TEXT",
     "token_count": "INTEGER",
 }
+
+OCR_RESULT_CACHE_CREATE_SQL = """
+CREATE TABLE ocr_result_cache (
+    id INTEGER PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    page_number INTEGER NOT NULL DEFAULT 0,
+    result_text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(content_hash, backend, page_number)
+)
+"""
 
 REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
     "documents": {
@@ -280,6 +315,15 @@ REQUIRED_TABLE_COLUMNS: dict[str, set[str]] = {
         "created_at",
         "updated_at",
     },
+    "ocr_result_cache": {
+        "id",
+        "content_hash",
+        "backend",
+        "page_number",
+        "result_text",
+        "created_at",
+        "updated_at",
+    },
     "schema_migrations": {"version", "name", "applied_at"},
 }
 
@@ -303,6 +347,7 @@ def _create_missing_core_tables(connection: sqlite3.Connection) -> None:
     for statement_index in (0, 3, 10, 12):
         connection.execute(MIGRATIONS[0].statements[statement_index])
     connection.execute(MIGRATIONS[2].statements[0])
+    connection.execute(MIGRATIONS[4].statements[0])
 
 
 def _create_dependent_schema_objects(connection: sqlite3.Connection) -> None:
@@ -311,6 +356,8 @@ def _create_dependent_schema_objects(connection: sqlite3.Connection) -> None:
     for statement_index in (1, 2, 4, 6, 7, 8, 9, 11, 13):
         connection.execute(MIGRATIONS[0].statements[statement_index])
     for statement in MIGRATIONS[2].statements[1:]:
+        connection.execute(statement)
+    for statement in MIGRATIONS[4].statements[1:]:
         connection.execute(statement)
 
 
@@ -352,6 +399,83 @@ def _ensure_chunks_fts_shape(connection: sqlite3.Connection) -> None:
     )
 
 
+def _has_ocr_result_cache_unique_key(connection: sqlite3.Connection) -> bool:
+    """Return whether cache upserts can target (content_hash, backend, page_number)."""
+
+    for index_row in connection.execute("PRAGMA index_list(ocr_result_cache)").fetchall():
+        index_name = str(index_row[1])
+        is_unique = bool(index_row[2])
+        if not is_unique:
+            continue
+        indexed_columns = tuple(
+            str(column_row[2])
+            for column_row in connection.execute(f"PRAGMA index_info({index_name})").fetchall()
+        )
+        if indexed_columns == ("content_hash", "backend", "page_number"):
+            return True
+    return False
+
+
+def _rebuild_ocr_result_cache_with_unique_key(connection: sqlite3.Connection) -> None:
+    """Recreate a stale cache table and preserve one row per cache key."""
+
+    legacy_table_name = "ocr_result_cache_legacy_repair"
+    connection.execute(f"DROP TABLE IF EXISTS {legacy_table_name}")
+    connection.execute(f"ALTER TABLE ocr_result_cache RENAME TO {legacy_table_name}")
+    connection.execute(OCR_RESULT_CACHE_CREATE_SQL)
+    connection.execute(
+        f"""
+        INSERT INTO ocr_result_cache(
+            content_hash, backend, page_number, result_text, created_at, updated_at
+        )
+        SELECT content_hash, backend, page_number, result_text, created_at, updated_at
+        FROM (
+            SELECT
+                content_hash,
+                backend,
+                page_number,
+                result_text,
+                created_at,
+                updated_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY content_hash, backend, page_number
+                    ORDER BY updated_at DESC, id DESC
+                ) AS row_rank
+            FROM {legacy_table_name}
+            WHERE content_hash IS NOT NULL
+              AND backend IS NOT NULL
+              AND page_number IS NOT NULL
+              AND result_text IS NOT NULL
+        )
+        WHERE row_rank = 1
+        """
+    )
+    connection.execute(f"DROP TABLE {legacy_table_name}")
+
+
+def _ensure_ocr_result_cache_unique_key(connection: sqlite3.Connection) -> None:
+    """Repair stale LDS-016 cache tables missing the required upsert key."""
+
+    if not _table_exists(connection, "ocr_result_cache"):
+        connection.execute(OCR_RESULT_CACHE_CREATE_SQL)
+        return
+    if not REQUIRED_TABLE_COLUMNS["ocr_result_cache"].issubset(
+        _table_columns(connection, "ocr_result_cache")
+    ):
+        return
+    if _has_ocr_result_cache_unique_key(connection):
+        return
+    try:
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ocr_result_cache_unique_key
+            ON ocr_result_cache(content_hash, backend, page_number)
+            """
+        )
+    except sqlite3.IntegrityError:
+        _rebuild_ocr_result_cache_with_unique_key(connection)
+
+
 def _backfill_chunks_fts(connection: sqlite3.Connection) -> None:
     """Refresh FTS rows from the current documents/chunks tables."""
 
@@ -390,6 +514,7 @@ def _repair_current_schema(connection: sqlite3.Connection) -> None:
         _drop_fts_triggers(connection)
         _ensure_chunks_fts_shape(connection)
         _backfill_chunks_fts(connection)
+        _ensure_ocr_result_cache_unique_key(connection)
         _create_dependent_schema_objects(connection)
 
 
@@ -406,6 +531,11 @@ def _validate_current_schema(connection: sqlite3.Connection) -> None:
     if missing:
         details = "; ".join(missing)
         raise RuntimeError(f"Database schema validation failed; missing {details}")
+    if not _has_ocr_result_cache_unique_key(connection):
+        raise RuntimeError(
+            "Database schema validation failed; missing unique key "
+            "ocr_result_cache.(content_hash, backend, page_number)"
+        )
 
 
 def resolve_database_path(database_path: str | Path | None = None) -> Path:

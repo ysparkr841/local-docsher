@@ -20,6 +20,7 @@ REQUIRED_TABLES = {
     "document_summaries",
     "insight_reports",
     "ocr_jobs",
+    "ocr_result_cache",
     "schema_migrations",
 }
 
@@ -98,6 +99,18 @@ def test_init_database_creates_required_schema_in_temp_db(tmp_path: Path) -> Non
                 "updated_at",
             },
         ),
+        (
+            "ocr_result_cache",
+            {
+                "id",
+                "content_hash",
+                "backend",
+                "page_number",
+                "result_text",
+                "created_at",
+                "updated_at",
+            },
+        ),
     ],
 )
 def test_core_tables_have_expected_columns(
@@ -139,6 +152,7 @@ def test_init_database_is_idempotent(tmp_path: Path) -> None:
         (2, "lds003_schema_repair_marker"),
         (3, "ocr_jobs_queue"),
         (4, "ocr_jobs_page_inputs"),
+        (5, "ocr_result_cache"),
     ]
     assert documents_count == 0
 
@@ -205,6 +219,7 @@ def test_init_database_repairs_stale_v1_schema(tmp_path: Path) -> None:
         (2, "lds003_schema_repair_marker"),
         (3, "ocr_jobs_queue"),
         (4, "ocr_jobs_page_inputs"),
+        (5, "ocr_result_cache"),
     ]
     assert {
         "extension",
@@ -474,6 +489,70 @@ def test_chunks_fts_updates_document_filename_and_path_context(tmp_path: Path) -
     assert new_filename_rows == [
         (1, "final.md", str(tmp_path / "published" / "final.md"))
     ]
+
+
+def test_init_database_repairs_stale_ocr_result_cache_missing_unique_key(tmp_path: Path) -> None:
+    database_path = tmp_path / "stale_cache.sqlite3"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO schema_migrations(version, name) VALUES
+                (1, 'initial_schema'),
+                (2, 'lds003_schema_repair_marker'),
+                (3, 'ocr_jobs_queue'),
+                (4, 'ocr_jobs_page_inputs'),
+                (5, 'ocr_result_cache');
+            CREATE TABLE ocr_result_cache (
+                id INTEGER PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                page_number INTEGER NOT NULL DEFAULT 0,
+                result_text TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            """
+        )
+
+    init_database(database_path)
+
+    from docsher.ocr import OCRResult, _cache_ocr_result
+
+    with sqlite3.connect(database_path) as connection:
+        _cache_ocr_result(
+            connection,
+            content_hash="same-content",
+            result=OCRResult(text="first text", backend="fake", page_number=1),
+        )
+        _cache_ocr_result(
+            connection,
+            content_hash="same-content",
+            result=OCRResult(text="updated text", backend="fake", page_number=1),
+        )
+        cache_rows = connection.execute(
+            "SELECT content_hash, backend, page_number, result_text FROM ocr_result_cache"
+        ).fetchall()
+        has_unique_key = False
+        for index_row in connection.execute("PRAGMA index_list(ocr_result_cache)").fetchall():
+            if not bool(index_row[2]):
+                continue
+            index_columns = tuple(
+                row[2]
+                for row in connection.execute(f"PRAGMA index_info({index_row[1]})").fetchall()
+            )
+            has_unique_key = has_unique_key or index_columns == (
+                "content_hash",
+                "backend",
+                "page_number",
+            )
+
+    assert cache_rows == [("same-content", "fake", 1, "updated text")]
+    assert has_unique_key
 
 
 def test_init_database_uses_configured_storage_path(

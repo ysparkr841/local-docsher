@@ -6,7 +6,13 @@ from pathlib import Path
 from docsher.cli import main
 from docsher.config import default_config
 from docsher.indexer import index_pending_documents
-from docsher.ocr import FakeOCRBackend, OCR_STATUS_COMPLETED, OCR_STATUS_QUEUED, process_next_ocr_job
+from docsher.ocr import (
+    FakeOCRBackend,
+    OCR_STATUS_COMPLETED,
+    OCR_STATUS_FAILED,
+    OCR_STATUS_QUEUED,
+    process_next_ocr_job,
+)
 from docsher.scanner import scan
 
 
@@ -160,6 +166,39 @@ def test_reindex_does_not_reset_completed_page_ocr_jobs(tmp_path: Path) -> None:
         (2, OCR_STATUS_QUEUED, None),
     ]
     assert chunks == [("page one text", 1)]
+
+
+def test_failed_page_keeps_multipage_document_failed_after_later_page_success(tmp_path: Path) -> None:
+    root = tmp_path / "docs"
+    root.mkdir()
+    make_two_page_scanned_pdf(root / "scanned.pdf")
+    config = make_config(tmp_path, root)
+    database_path = Path(config["storage"]["database_path"])
+
+    scan(config)
+    index_pending_documents(database_path)
+    failed_job = process_next_ocr_job(database_path, FakeOCRBackend("unused", fail=True))
+    succeeded_job = process_next_ocr_job(database_path, FakeOCRBackend("page two text"))
+
+    assert failed_job is not None
+    assert succeeded_job is not None
+    assert failed_job.page_number == 1
+    assert failed_job.status == OCR_STATUS_FAILED
+    assert succeeded_job.page_number == 2
+    assert succeeded_job.status == OCR_STATUS_COMPLETED
+    with sqlite3.connect(database_path) as connection:
+        document = connection.execute(
+            "SELECT status, parser_name, ocr_status FROM documents WHERE filename = 'scanned.pdf'"
+        ).fetchone()
+        jobs = connection.execute(
+            "SELECT page_number, status FROM ocr_jobs ORDER BY page_number"
+        ).fetchall()
+        chunks = connection.execute(
+            "SELECT text, page_number FROM chunks ORDER BY page_number"
+        ).fetchall()
+    assert document == ("pending", "ocr:fake", OCR_STATUS_FAILED)
+    assert jobs == [(1, OCR_STATUS_FAILED), (2, OCR_STATUS_COMPLETED)]
+    assert chunks == [("page two text", 2)]
 
 
 def test_completed_ocr_result_becomes_searchable_chunk_with_page_number(tmp_path: Path) -> None:

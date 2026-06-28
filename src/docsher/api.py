@@ -165,6 +165,10 @@ def _render_status_page(payload: dict[str, Any]) -> str:
         ("Failed", "failed_count"),
         ("Pending", "pending_count"),
         ("Deleted", "deleted_count"),
+        ("OCR queued", "ocr_queued_count"),
+        ("OCR completed", "ocr_completed_count"),
+        ("OCR failed", "ocr_failed_count"),
+        ("OCR processing", "ocr_processing_count"),
     )
     for label, key in stats:
         body_parts.append(
