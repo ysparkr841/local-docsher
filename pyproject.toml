@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "local-docsher"
+version = "0.1.0"
+description = "Local offline document indexing and search system."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Local Docsher Contributors" }
+]
+keywords = ["local", "documents", "search", "sqlite", "fts"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+]
+dependencies = []
+
+[project.scripts]
+docsher = "docsher.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+api = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+]
+parsers = [
+  "pypdf>=5.0",
+  "python-docx>=1.1",
+  "python-pptx>=1.0",
+  "openpyxl>=3.1",
+]
+ocr = []
+llm = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docsher"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"

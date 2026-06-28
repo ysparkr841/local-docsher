@@ -1,0 +1,42 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build/package artifacts
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime data
+*.sqlite3
+*.db
+*.db-*
+*.log
+
+# Local temporary verification fixtures
+.tmp*/
+tmp/
+temp/
+
+# Local/private configuration
+.env
+.env.*
+*.local.json
+
+# Private planning / blueprint / agent-orchestration notes excluded from public repo
+.hermes.md
+docs/PLAN.md
+docs/question.md
+docs/ORCHESTRATION.md
+docs/STATE.md
