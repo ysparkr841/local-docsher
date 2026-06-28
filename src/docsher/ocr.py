@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from docsher.chunker import chunk_text
+from docsher.config import get_ocr_settings
 from docsher.db import connect, init_database
 
 OCR_STATUS_QUEUED = "queued"
@@ -17,6 +19,10 @@ OCR_STATUS_COMPLETED = "completed"
 OCR_STATUS_FAILED = "failed"
 OCR_STATUS_NOT_REQUIRED = "not_required"
 DEFAULT_OCR_BACKEND = "default"
+
+
+class OCRBackendError(RuntimeError):
+    """Raised when an optional OCR backend cannot run or parse its result."""
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,150 @@ class FakeOCRBackend:
         if self.fail:
             raise RuntimeError(f"fake OCR failed for {Path(path).name}")
         return OCRResult(text=self.text, backend=self.name, page_number=self.page_number)
+
+
+class PaddleOCRBackend:
+    """PaddleOCR backend with offline model directory support.
+
+    The implementation imports ``paddleocr`` lazily so Docsher remains usable in
+    minimal/offline installs. For offline deployments, pre-download PaddleOCR
+    detection/recognition/classification models and pass their local directories.
+    """
+
+    name = "paddle"
+
+    def __init__(
+        self,
+        *,
+        lang: str = "korean",
+        det_model_dir: str | Path | None = None,
+        rec_model_dir: str | Path | None = None,
+        cls_model_dir: str | Path | None = None,
+        use_angle_cls: bool = True,
+        show_log: bool = False,
+    ) -> None:
+        self.lang = lang
+        self.det_model_dir = str(det_model_dir) if det_model_dir is not None else None
+        self.rec_model_dir = str(rec_model_dir) if rec_model_dir is not None else None
+        self.cls_model_dir = str(cls_model_dir) if cls_model_dir is not None else None
+        self.use_angle_cls = use_angle_cls
+        self.show_log = show_log
+        self._engine: Any | None = None
+        self._import_error: Exception | None = None
+
+    def _load_engine(self) -> Any:
+        if self._engine is not None:
+            return self._engine
+        try:
+            from paddleocr import PaddleOCR  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001 - optional dependency boundary.
+            self._import_error = exc
+            raise OCRBackendError(
+                "PaddleOCR backend unavailable: install the optional paddleocr dependency "
+                "and provide local model directories for offline use."
+            ) from exc
+
+        options = self._build_paddle_options(PaddleOCR)
+        try:
+            self._engine = PaddleOCR(**options)
+        except Exception as exc:  # noqa: BLE001 - optional dependency/model boundary.
+            raise OCRBackendError(
+                f"PaddleOCR backend unavailable: {exc}. Install paddleocr plus paddlepaddle, "
+                "and provide local model directories for offline use."
+            ) from exc
+        return self._engine
+
+    def _build_paddle_options(self, paddle_cls: object) -> dict[str, object]:
+        signature = inspect.signature(paddle_cls)
+        parameters = signature.parameters
+        supports_v3_names = "text_detection_model_dir" in parameters
+        options: dict[str, object] = {"lang": self.lang}
+        if supports_v3_names:
+            options["use_doc_orientation_classify"] = False
+            options["use_doc_unwarping"] = False
+            options["use_textline_orientation"] = self.use_angle_cls
+            if self.det_model_dir:
+                options["text_detection_model_dir"] = self.det_model_dir
+            if self.rec_model_dir:
+                options["text_recognition_model_dir"] = self.rec_model_dir
+            if self.cls_model_dir:
+                options["textline_orientation_model_dir"] = self.cls_model_dir
+            return options
+
+        options["use_angle_cls"] = self.use_angle_cls
+        if "show_log" in parameters:
+            options["show_log"] = self.show_log
+        if self.det_model_dir:
+            options["det_model_dir"] = self.det_model_dir
+        if self.rec_model_dir:
+            options["rec_model_dir"] = self.rec_model_dir
+        if self.cls_model_dir:
+            options["cls_model_dir"] = self.cls_model_dir
+        return options
+
+    def is_available(self) -> bool:
+        try:
+            self._load_engine()
+        except OCRBackendError:
+            return False
+        return True
+
+    def recognize(self, path: str | Path) -> OCRResult:
+        image_path = Path(path).expanduser().resolve(strict=False)
+        engine = self._load_engine()
+        try:
+            try:
+                raw_result = engine.ocr(str(image_path), cls=True)
+            except TypeError as exc:
+                if "unexpected keyword argument 'cls'" not in str(exc):
+                    raise
+                raw_result = engine.ocr(str(image_path))
+        except Exception as exc:  # noqa: BLE001 - optional backend boundary.
+            raise OCRBackendError(f"PaddleOCR failed for {image_path}: {exc}") from exc
+
+        lines = _extract_paddle_text_lines(raw_result)
+        if not lines:
+            raise OCRBackendError(f"PaddleOCR returned no text for {image_path}")
+        return OCRResult(text="\n".join(lines), backend=self.name)
+
+
+def _extract_paddle_text_lines(raw_result: object) -> list[str]:
+    """Normalize PaddleOCR output across common package versions."""
+
+    lines: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, tuple) and len(value) >= 2 and isinstance(value[0], str):
+            lines.append(value[0])
+            return
+        if isinstance(value, list):
+            if len(value) >= 2 and isinstance(value[1], tuple) and value[1] and isinstance(value[1][0], str):
+                lines.append(value[1][0])
+                return
+            for item in value:
+                visit(item)
+
+    visit(raw_result)
+    return [line.strip() for line in lines if line.strip()]
+
+
+def create_ocr_backend(config: dict[str, Any] | None = None, *, backend_name: str | None = None) -> OCRBackend:
+    """Create an OCR backend from configuration or an explicit backend name."""
+
+    settings = get_ocr_settings(config or {})
+    selected = (backend_name or settings["backend"] or "fake").lower()
+    if selected in {"fake", DEFAULT_OCR_BACKEND}:
+        return FakeOCRBackend()
+    if selected in {"paddle", "paddleocr"}:
+        paddle = settings["paddle"]
+        return PaddleOCRBackend(
+            lang=str(paddle["lang"]),
+            det_model_dir=paddle["det_model_dir"],
+            rec_model_dir=paddle["rec_model_dir"],
+            cls_model_dir=paddle["cls_model_dir"],
+            use_angle_cls=bool(paddle["use_angle_cls"]),
+        )
+    raise ValueError(f"Unsupported OCR backend: {selected}")
 
 
 def _utc_now_iso() -> str:

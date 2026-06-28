@@ -37,7 +37,10 @@ parsers = [
   "python-pptx>=1.0",
   "openpyxl>=3.1",
 ]
-ocr = []
+ocr = [
+  "paddleocr>=2.8",
+  "paddlepaddle>=3.0",
+]
 llm = []
 
 [tool.hatch.build.targets.wheel]

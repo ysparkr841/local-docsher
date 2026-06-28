@@ -11,6 +11,7 @@ from docsher import __version__
 from docsher.config import (
     add_root,
     get_indexing_schedule,
+    get_ocr_settings,
     list_roots,
     load_config_with_location,
     remove_root,
@@ -18,7 +19,7 @@ from docsher.config import (
 )
 from docsher.db import init_database
 from docsher.indexer import SUPPORTED_IMAGE_EXTENSIONS, format_index_result
-from docsher.ocr import FakeOCRBackend
+from docsher.ocr import FakeOCRBackend, OCRBackendError, PaddleOCRBackend
 from docsher.parsers_office import parse_office_document
 from docsher.scanner import format_scan_result, scan
 from docsher.scheduler import run_scheduled_index_once
@@ -201,8 +202,29 @@ def _cmd_ocr_test(args: argparse.Namespace) -> int:
         "text_layer_pages": extracted_pages,
     }
     if ocr_required:
-        result = FakeOCRBackend(args.fake_text, page_number=args.page_number).recognize(document_path)
-        payload["fake_ocr"] = result.to_dict()
+        backend_name = args.backend
+        if backend_name == "fake":
+            backend = FakeOCRBackend(args.fake_text, page_number=args.page_number)
+        else:
+            config, _location = load_config_with_location()
+            paddle_settings = get_ocr_settings(config)["paddle"]
+            backend = PaddleOCRBackend(
+                lang=args.paddle_lang or str(paddle_settings["lang"]),
+                det_model_dir=args.paddle_det_model_dir or paddle_settings["det_model_dir"],
+                rec_model_dir=args.paddle_rec_model_dir or paddle_settings["rec_model_dir"],
+                cls_model_dir=args.paddle_cls_model_dir or paddle_settings["cls_model_dir"],
+                use_angle_cls=not args.no_angle_cls,
+            )
+        try:
+            result = backend.recognize(document_path)
+        except OCRBackendError as exc:
+            print(f"OCR test error: {exc}")
+            return 2
+        if result.page_number is None and args.page_number:
+            result = type(result)(text=result.text, backend=result.backend, page_number=args.page_number)
+        payload["ocr_result"] = result.to_dict()
+        if backend_name == "fake":
+            payload["fake_ocr"] = result.to_dict()
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
@@ -361,9 +383,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     ocr_test_parser = subparsers.add_parser(
         "ocr-test",
-        help="Inspect whether a PDF/image needs OCR and run a fake offline OCR smoke test.",
+        help="Inspect whether a PDF/image needs OCR and run a selectable offline OCR smoke test.",
     )
     ocr_test_parser.add_argument("path", help="PDF or image file to inspect.")
+    ocr_test_parser.add_argument(
+        "--backend",
+        choices=("fake", "paddle"),
+        default="fake",
+        help="OCR backend to exercise for this smoke test (default: fake).",
+    )
     ocr_test_parser.add_argument(
         "--fake-text",
         default="fake OCR text",
@@ -373,7 +401,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--page-number",
         type=int,
         default=1,
-        help="Page number attached to fake OCR output when OCR is required.",
+        help="Page number attached to OCR output when OCR is required.",
+    )
+    ocr_test_parser.add_argument("--paddle-lang", help="PaddleOCR language, for example korean or en.")
+    ocr_test_parser.add_argument("--paddle-det-model-dir", help="Offline PaddleOCR detection model directory.")
+    ocr_test_parser.add_argument("--paddle-rec-model-dir", help="Offline PaddleOCR recognition model directory.")
+    ocr_test_parser.add_argument("--paddle-cls-model-dir", help="Offline PaddleOCR angle classifier model directory.")
+    ocr_test_parser.add_argument(
+        "--no-angle-cls",
+        action="store_true",
+        help="Disable PaddleOCR angle classifier for this smoke test.",
     )
     ocr_test_parser.set_defaults(func=_cmd_ocr_test)
 

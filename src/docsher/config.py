@@ -45,6 +45,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "backend": "paddle",
         "fallback_backend": "tesseract",
+        "paddle": {
+            "lang": "korean",
+            "det_model_dir": None,
+            "rec_model_dir": None,
+            "cls_model_dir": None,
+            "use_angle_cls": True,
+        },
     },
 }
 
@@ -157,6 +164,35 @@ def get_indexing_schedule(config: dict[str, Any]) -> dict[str, Any]:
         "schedule": str(indexing.get("schedule", defaults["schedule"])),
         "time": str(indexing.get("time", defaults["time"])),
         "incremental": bool(indexing.get("incremental", defaults["incremental"])),
+    }
+
+
+def get_ocr_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Return OCR settings with defaults merged in.
+
+    PaddleOCR supports offline operation when model directories are pre-downloaded
+    and provided through ``ocr.paddle.*_model_dir``. Keeping this shape in the
+    stdlib config layer lets CLI, API, and background workers select the same
+    backend without importing optional OCR dependencies.
+    """
+
+    ocr = config.setdefault("ocr", {})
+    defaults = DEFAULT_CONFIG["ocr"]
+    paddle_defaults = defaults["paddle"]
+    paddle_config = ocr.get("paddle", {})
+    if not isinstance(paddle_config, dict):
+        paddle_config = {}
+    return {
+        "enabled": bool(ocr.get("enabled", defaults["enabled"])),
+        "backend": str(ocr.get("backend", defaults["backend"])),
+        "fallback_backend": ocr.get("fallback_backend", defaults["fallback_backend"]),
+        "paddle": {
+            "lang": str(paddle_config.get("lang", paddle_defaults["lang"])),
+            "det_model_dir": paddle_config.get("det_model_dir", paddle_defaults["det_model_dir"]),
+            "rec_model_dir": paddle_config.get("rec_model_dir", paddle_defaults["rec_model_dir"]),
+            "cls_model_dir": paddle_config.get("cls_model_dir", paddle_defaults["cls_model_dir"]),
+            "use_angle_cls": bool(paddle_config.get("use_angle_cls", paddle_defaults["use_angle_cls"])),
+        },
     }
 
 
