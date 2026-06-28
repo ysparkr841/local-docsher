@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import inspect
+import json
 import sqlite3
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -221,6 +225,101 @@ def _extract_paddle_text_lines(raw_result: object) -> list[str]:
     return [line.strip() for line in lines if line.strip()]
 
 
+class UnlimitedOCRBackend:
+    """Experimental backend for a local Unlimited-OCR OpenAI-compatible server.
+
+    Unlimited-OCR is too large to run as an in-process optional dependency for
+    the Docsher MVP. This backend targets the project's documented SGLang
+    OpenAI-compatible server mode so Docsher can use it when the user has already
+    launched the model locally.
+    """
+
+    name = "unlimited"
+
+    def __init__(
+        self,
+        *,
+        endpoint: str = "http://127.0.0.1:10000/v1/chat/completions",
+        model: str = "Unlimited-OCR",
+        prompt: str = "document parsing.",
+        timeout_seconds: int = 1200,
+    ) -> None:
+        self.endpoint = endpoint
+        self.model = model
+        self.prompt = prompt
+        self.timeout_seconds = timeout_seconds
+
+    def is_available(self) -> bool:
+        return self.endpoint.startswith(("http://", "https://"))
+
+    def recognize(self, path: str | Path) -> OCRResult:
+        image_path = Path(path).expanduser().resolve(strict=False)
+        if not image_path.exists():
+            raise OCRBackendError(f"Unlimited-OCR input not found: {image_path}")
+        image_payload = _image_data_url(image_path)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": self.prompt},
+                        {"type": "image_url", "image_url": {"url": image_payload}},
+                    ],
+                }
+            ],
+            "temperature": 0,
+            "stream": False,
+        }
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310 - user-configured local endpoint.
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise OCRBackendError(
+                f"Unlimited-OCR backend unavailable at {self.endpoint}: {exc}"
+            ) from exc
+        text = _extract_openai_message_text(response_payload)
+        if not text:
+            raise OCRBackendError("Unlimited-OCR returned no text")
+        return OCRResult(text=text, backend=self.name)
+
+
+def _image_data_url(path: Path) -> str:
+    extension = path.suffix.lower().lstrip(".") or "png"
+    mime = "image/jpeg" if extension in {"jpg", "jpeg"} else f"image/{extension}"
+    return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+
+
+def _extract_openai_message_text(payload: object) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        return "\n".join(part.strip() for part in parts if part.strip())
+    return ""
+
+
 def create_ocr_backend(config: dict[str, Any] | None = None, *, backend_name: str | None = None) -> OCRBackend:
     """Create an OCR backend from configuration or an explicit backend name."""
 
@@ -236,6 +335,14 @@ def create_ocr_backend(config: dict[str, Any] | None = None, *, backend_name: st
             rec_model_dir=paddle["rec_model_dir"],
             cls_model_dir=paddle["cls_model_dir"],
             use_angle_cls=bool(paddle["use_angle_cls"]),
+        )
+    if selected in {"unlimited", "unlimited-ocr"}:
+        unlimited = settings["unlimited"]
+        return UnlimitedOCRBackend(
+            endpoint=str(unlimited["endpoint"]),
+            model=str(unlimited["model"]),
+            prompt=str(unlimited["prompt"]),
+            timeout_seconds=int(unlimited["timeout_seconds"]),
         )
     raise ValueError(f"Unsupported OCR backend: {selected}")
 

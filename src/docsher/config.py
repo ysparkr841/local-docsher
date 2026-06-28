@@ -52,6 +52,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "cls_model_dir": None,
             "use_angle_cls": True,
         },
+        "unlimited": {
+            "endpoint": "http://127.0.0.1:10000/v1/chat/completions",
+            "model": "Unlimited-OCR",
+            "prompt": "document parsing.",
+            "timeout_seconds": 1200,
+        },
     },
 }
 
@@ -179,9 +185,13 @@ def get_ocr_settings(config: dict[str, Any]) -> dict[str, Any]:
     ocr = config.setdefault("ocr", {})
     defaults = DEFAULT_CONFIG["ocr"]
     paddle_defaults = defaults["paddle"]
+    unlimited_defaults = defaults["unlimited"]
     paddle_config = ocr.get("paddle", {})
     if not isinstance(paddle_config, dict):
         paddle_config = {}
+    unlimited_config = ocr.get("unlimited", {})
+    if not isinstance(unlimited_config, dict):
+        unlimited_config = {}
     return {
         "enabled": bool(ocr.get("enabled", defaults["enabled"])),
         "backend": str(ocr.get("backend", defaults["backend"])),
@@ -192,6 +202,12 @@ def get_ocr_settings(config: dict[str, Any]) -> dict[str, Any]:
             "rec_model_dir": paddle_config.get("rec_model_dir", paddle_defaults["rec_model_dir"]),
             "cls_model_dir": paddle_config.get("cls_model_dir", paddle_defaults["cls_model_dir"]),
             "use_angle_cls": bool(paddle_config.get("use_angle_cls", paddle_defaults["use_angle_cls"])),
+        },
+        "unlimited": {
+            "endpoint": str(unlimited_config.get("endpoint", unlimited_defaults["endpoint"])),
+            "model": str(unlimited_config.get("model", unlimited_defaults["model"])),
+            "prompt": str(unlimited_config.get("prompt", unlimited_defaults["prompt"])),
+            "timeout_seconds": int(unlimited_config.get("timeout_seconds", unlimited_defaults["timeout_seconds"])),
         },
     }
 

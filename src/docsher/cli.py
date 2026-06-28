@@ -19,7 +19,7 @@ from docsher.config import (
 )
 from docsher.db import init_database
 from docsher.indexer import SUPPORTED_IMAGE_EXTENSIONS, format_index_result
-from docsher.ocr import FakeOCRBackend, OCRBackendError, PaddleOCRBackend
+from docsher.ocr import FakeOCRBackend, OCRBackendError, PaddleOCRBackend, UnlimitedOCRBackend
 from docsher.parsers_office import parse_office_document
 from docsher.scanner import format_scan_result, scan
 from docsher.scheduler import run_scheduled_index_once
@@ -205,7 +205,7 @@ def _cmd_ocr_test(args: argparse.Namespace) -> int:
         backend_name = args.backend
         if backend_name == "fake":
             backend = FakeOCRBackend(args.fake_text, page_number=args.page_number)
-        else:
+        elif backend_name == "paddle":
             config, _location = load_config_with_location()
             paddle_settings = get_ocr_settings(config)["paddle"]
             backend = PaddleOCRBackend(
@@ -214,6 +214,15 @@ def _cmd_ocr_test(args: argparse.Namespace) -> int:
                 rec_model_dir=args.paddle_rec_model_dir or paddle_settings["rec_model_dir"],
                 cls_model_dir=args.paddle_cls_model_dir or paddle_settings["cls_model_dir"],
                 use_angle_cls=not args.no_angle_cls,
+            )
+        else:
+            config, _location = load_config_with_location()
+            unlimited_settings = get_ocr_settings(config)["unlimited"]
+            backend = UnlimitedOCRBackend(
+                endpoint=args.unlimited_endpoint or str(unlimited_settings["endpoint"]),
+                model=args.unlimited_model or str(unlimited_settings["model"]),
+                prompt=args.unlimited_prompt or str(unlimited_settings["prompt"]),
+                timeout_seconds=args.unlimited_timeout or int(unlimited_settings["timeout_seconds"]),
             )
         try:
             result = backend.recognize(document_path)
@@ -388,7 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
     ocr_test_parser.add_argument("path", help="PDF or image file to inspect.")
     ocr_test_parser.add_argument(
         "--backend",
-        choices=("fake", "paddle"),
+        choices=("fake", "paddle", "unlimited"),
         default="fake",
         help="OCR backend to exercise for this smoke test (default: fake).",
     )
@@ -411,6 +420,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-angle-cls",
         action="store_true",
         help="Disable PaddleOCR angle classifier for this smoke test.",
+    )
+    ocr_test_parser.add_argument("--unlimited-endpoint", help="Unlimited-OCR OpenAI-compatible chat/completions endpoint.")
+    ocr_test_parser.add_argument("--unlimited-model", help="Unlimited-OCR served model name.")
+    ocr_test_parser.add_argument("--unlimited-prompt", help="Prompt sent to Unlimited-OCR.")
+    ocr_test_parser.add_argument(
+        "--unlimited-timeout",
+        type=int,
+        help="Unlimited-OCR request timeout in seconds.",
     )
     ocr_test_parser.set_defaults(func=_cmd_ocr_test)
 
