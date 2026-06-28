@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from docsher import __version__
+from docsher.ask import ask_question, format_ask_response
 from docsher.config import (
     add_root,
     get_indexing_schedule,
@@ -19,6 +20,7 @@ from docsher.config import (
 )
 from docsher.db import init_database
 from docsher.indexer import SUPPORTED_IMAGE_EXTENSIONS, format_index_result
+from docsher.llm import LLMClientError, create_llm_client
 from docsher.ocr import FakeOCRBackend, OCRBackendError, PaddleOCRBackend, UnlimitedOCRBackend
 from docsher.parsers_office import parse_office_document
 from docsher.scanner import format_scan_result, scan
@@ -161,6 +163,31 @@ def _cmd_search(args: argparse.Namespace) -> int:
         )
     else:
         print(format_search_results(results))
+    return 0
+
+
+def _cmd_ask(args: argparse.Namespace) -> int:
+    config, _location = load_config_with_location()
+    database_path = args.database_path or config["storage"]["database_path"]
+    try:
+        llm_client = create_llm_client(config, provider=args.provider)
+        response = ask_question(
+            args.question,
+            llm_client=llm_client,
+            database_path=database_path,
+            top_k=args.top_k,
+        )
+    except (SearchError, ValueError) as exc:
+        print(f"Ask error: {exc}")
+        return 2
+    except LLMClientError as exc:
+        print(f"Ask error: {exc}")
+        return 2
+
+    if args.json:
+        print(json.dumps(response.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(format_ask_response(response))
     return 0
 
 
@@ -374,6 +401,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit deterministic machine-readable JSON output.",
     )
     search_parser.set_defaults(func=_cmd_search)
+
+    ask_parser = subparsers.add_parser(
+        "ask",
+        help="Answer a question using only indexed document search evidence.",
+    )
+    ask_parser.add_argument(
+        "question",
+        help="Question to answer from indexed documents.",
+    )
+    ask_parser.add_argument(
+        "--database-path",
+        help="SQLite database path to use instead of storage.database_path from config.",
+    )
+    ask_parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Maximum number of search results to ground the answer (default: 5).",
+    )
+    ask_parser.add_argument(
+        "--provider",
+        choices=("dummy", "ollama", "openai", "openai-compatible", "openai_compatible"),
+        help="Override configured LLM provider. Use dummy for offline smoke tests.",
+    )
+    ask_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit deterministic machine-readable JSON output.",
+    )
+    ask_parser.set_defaults(func=_cmd_ask)
 
     status_parser = subparsers.add_parser(
         "status",

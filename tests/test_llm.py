@@ -16,6 +16,7 @@ from docsher.llm import (
     OpenAICompatibleLLMClient,
     create_llm_client,
     extract_openai_message_text,
+    redact_endpoint,
 )
 from docsher.search import search_documents
 
@@ -117,13 +118,26 @@ def test_openai_compatible_client_wraps_connection_failure(monkeypatch: pytest.M
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     client = OpenAICompatibleLLMClient(
-        endpoint="http://127.0.0.1:1/v1/chat/completions",
+        endpoint="http://user:credential@127.0.0.1:1/v1/chat/completions?credential=credential-value",
         model="small-local",
         timeout_seconds=1,
     )
 
-    with pytest.raises(LLMClientError, match="LLM backend unavailable"):
+    with pytest.raises(LLMClientError) as exc_info:
         client.chat([LLMMessage(role="user", content="hello")])
+
+    message = str(exc_info.value)
+    assert "LLM backend unavailable" in message
+    assert "http://127.0.0.1:1/v1/chat/completions?<redacted>" in message
+    assert "credential" not in message
+
+
+def test_redact_endpoint_removes_userinfo_and_query_values() -> None:
+    assert (
+        redact_endpoint("http://user:pass@localhost:11434/v1/chat/completions?credential=abc")
+        == "http://localhost:11434/v1/chat/completions?<redacted>"
+    )
+    assert redact_endpoint("not a url") == "<redacted-endpoint>"
 
 
 def test_extract_openai_message_text_supports_text_and_content_parts() -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
@@ -75,6 +76,29 @@ class DummyLLMClient:
         return LLMResponse(text=self.text, model=self.model, provider=self.provider)
 
 
+def redact_endpoint(endpoint: str) -> str:
+    """Return an endpoint string safe for user-facing errors.
+
+    Users may accidentally place credentials in URL userinfo or query strings.
+    Error messages should keep enough host/path context for troubleshooting while
+    avoiding credential leakage through API/CLI responses.
+    """
+
+    try:
+        parsed = urllib.parse.urlsplit(endpoint)
+    except ValueError:
+        return "<redacted-endpoint>"
+    if not parsed.scheme or not parsed.netloc:
+        return "<redacted-endpoint>"
+    hostname = parsed.hostname or ""
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    path = parsed.path or ""
+    query = "<redacted>" if parsed.query else ""
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, path, query, ""))
+
+
 class OpenAICompatibleLLMClient:
     """Client for local OpenAI-compatible ``/v1/chat/completions`` servers."""
 
@@ -121,7 +145,8 @@ class OpenAICompatibleLLMClient:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310 - user-configured local endpoint.
                 response_payload = json.loads(response.read().decode("utf-8"))
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise LLMClientError(f"LLM backend unavailable at {self.endpoint}: {exc}") from exc
+            safe_endpoint = redact_endpoint(self.endpoint)
+            raise LLMClientError(f"LLM backend unavailable at {safe_endpoint}: {exc}") from exc
         text = extract_openai_message_text(response_payload)
         if not text:
             raise LLMClientError("LLM backend returned no text")

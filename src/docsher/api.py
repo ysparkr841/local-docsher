@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from docsher import __version__
+from docsher.ask import ask_question
 from docsher.config import get_indexing_schedule, load_config, load_config_with_location, save_config, validate_indexing_schedule
 from docsher.db import connect, init_database
+from docsher.llm import LLMClientError, create_llm_client
 from docsher.scheduler import run_scheduled_index_once
 from docsher.search import SearchError, search_documents
 from docsher.status import get_index_status
@@ -630,6 +632,33 @@ def create_app(
             "count": len(results),
             "results": [result.to_dict() for result in results],
         }
+
+    @app.post("/ask")
+    def ask(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        question = payload.get("question")
+        if not isinstance(question, str) or not question.strip():
+            raise HTTPException(status_code=422, detail="question must be a non-empty string")
+        top_k_value = payload.get("top_k", 5)
+        if not isinstance(top_k_value, int) or top_k_value < 1 or top_k_value > MAX_TOP_K:
+            raise HTTPException(status_code=422, detail=f"top_k must be an integer between 1 and {MAX_TOP_K}")
+
+        config, resolved_database_path = _resolve_config_and_database(
+            config_path=app.state.config_path,
+            database_path=app.state.database_path,
+        )
+        llm_client = getattr(app.state, "llm_client", None)
+        if llm_client is None:
+            llm_client = create_llm_client(config)
+        try:
+            response = ask_question(
+                question,
+                llm_client=llm_client,
+                database_path=resolved_database_path,
+                top_k=top_k_value,
+            )
+        except LLMClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return response.to_dict()
 
     @app.get("/documents/{document_id}")
     def get_document(
