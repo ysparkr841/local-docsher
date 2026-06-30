@@ -27,6 +27,7 @@ from docsher.scanner import format_scan_result, scan
 from docsher.scheduler import run_scheduled_index_once
 from docsher.search import SearchError, format_search_results, search_documents
 from docsher.status import format_index_status, get_index_status
+from docsher.summarize import format_document_summary, summarize_document
 
 
 def _cmd_config_show(_args: argparse.Namespace) -> int:
@@ -188,6 +189,28 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         print(json.dumps(response.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_ask_response(response))
+    return 0
+
+
+def _cmd_summarize(args: argparse.Namespace) -> int:
+    config, _location = load_config_with_location()
+    database_path = args.database_path or config["storage"]["database_path"]
+    try:
+        llm_client = create_llm_client(config, provider=args.provider)
+        summary = summarize_document(
+            args.document_id,
+            llm_client=llm_client,
+            database_path=database_path,
+            force=args.force,
+        )
+    except (ValueError, LLMClientError) as exc:
+        print(f"Summarize error: {exc}")
+        return 2
+
+    if args.json:
+        print(json.dumps(summary.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(format_document_summary(summary))
     return 0
 
 
@@ -431,6 +454,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit deterministic machine-readable JSON output.",
     )
     ask_parser.set_defaults(func=_cmd_ask)
+
+    summarize_parser = subparsers.add_parser(
+        "summarize",
+        help="Generate or reuse a stored summary for one indexed document.",
+    )
+    summarize_parser.add_argument(
+        "--document-id",
+        type=int,
+        required=True,
+        help="Indexed document ID to summarize.",
+    )
+    summarize_parser.add_argument(
+        "--database-path",
+        help="SQLite database path to use instead of storage.database_path from config.",
+    )
+    summarize_parser.add_argument(
+        "--provider",
+        choices=("dummy", "ollama", "openai", "openai-compatible", "openai_compatible"),
+        help="Override configured LLM provider. Use dummy for offline smoke tests.",
+    )
+    summarize_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Regenerate the summary instead of reusing an existing or same-hash summary.",
+    )
+    summarize_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit deterministic machine-readable JSON output.",
+    )
+    summarize_parser.set_defaults(func=_cmd_summarize)
 
     status_parser = subparsers.add_parser(
         "status",

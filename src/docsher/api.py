@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import asdict, is_dataclass
 from html import escape
@@ -16,6 +17,7 @@ from docsher.llm import LLMClientError, create_llm_client
 from docsher.scheduler import run_scheduled_index_once
 from docsher.search import SearchError, search_documents
 from docsher.status import get_index_status
+from docsher.summarize import get_document_summary, summarize_document
 
 try:  # pragma: no cover - exercised implicitly when FastAPI is installed.
     from fastapi import Body, FastAPI, HTTPException, Query, Request
@@ -282,7 +284,33 @@ def _render_document_page(payload: dict[str, Any]) -> str:
     ):
         value = document.get(key)
         body_parts.append(f"<dt>{escape(key)}</dt><dd>{escape('' if value is None else str(value))}</dd>")
-    body_parts.extend(["</dl>", "</section>", '<section aria-label="Chunk previews">', "<h2>Chunk previews</h2>"])
+    body_parts.extend(["</dl>", "</section>"])
+    summary = payload.get("summary")
+    body_parts.extend(['<section aria-label="Document summary">', "<h2>Summary</h2>"])
+    if isinstance(summary, dict):
+        summary_text = escape(str(summary.get("summary") or ""))
+        keywords = summary.get("keywords") or []
+        keyword_text = ", ".join(str(keyword) for keyword in keywords) if isinstance(keywords, list) else ""
+        doc_type = escape(str(summary.get("document_type_candidate") or "unknown"))
+        generated_at = escape(str(summary.get("generated_at") or ""))
+        model_name = escape(str(summary.get("model_name") or ""))
+        body_parts.append(
+            '<article class="chunk">'
+            f'<div class="preview">{summary_text}</div>'
+            f'<div class="meta"><strong>Keywords:</strong> {escape(keyword_text) if keyword_text else "(none)"}</div>'
+            f'<div class="meta"><strong>Document type candidate:</strong> {doc_type}</div>'
+            f'<div class="meta"><strong>Generated at:</strong> {generated_at} · <strong>Model:</strong> {model_name}</div>'
+            '</article>'
+        )
+    else:
+        document_id = escape(str(document.get("id")))
+        body_parts.append(
+            '<div class="state" role="status">No summary is stored for this document yet.</div>'
+            f'<form method="post" action="/documents/{document_id}/summarize">'
+            '<button type="submit">Generate summary</button>'
+            '</form>'
+        )
+    body_parts.extend(["</section>", '<section aria-label="Chunk previews">', "<h2>Chunk previews</h2>"])
     chunks = payload.get("chunks") or []
     if not chunks:
         body_parts.append('<div class="state" role="status">No chunks are available for this document.</div>')
@@ -357,6 +385,42 @@ def _normalize_schedule_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _decode_summary_keywords(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(payload, list):
+        return [str(item).strip() for item in payload if str(item).strip()]
+    return []
+
+
+def _extract_summary_document_type(summary: str) -> str:
+    for line in summary.splitlines():
+        normalized = line.strip().lstrip("-*# ").strip()
+        lowered = normalized.lower()
+        for prefix in ("document type candidate:", "document type:", "문서 유형 후보:", "문서 유형:"):
+            if lowered.startswith(prefix):
+                return normalized[len(prefix) :].strip() or "unknown"
+    return "unknown"
+
+
+def _summary_row_to_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    summary_text = str(row["summary"] or "")
+    return {
+        "document_id": int(row["document_id"]),
+        "summary": summary_text,
+        "keywords": _decode_summary_keywords(row["keywords"]),
+        "document_type_candidate": _extract_summary_document_type(summary_text),
+        "generated_at": row["generated_at"],
+        "model_name": row["model_name"],
+    }
+
+
 def _fetch_document_payload(
     *,
     database_path: str | Path,
@@ -390,6 +454,14 @@ def _fetch_document_payload(
             """,
             (document_id,),
         ).fetchall()
+        summary = connection.execute(
+            """
+            SELECT document_id, summary, keywords, generated_at, model_name
+            FROM document_summaries
+            WHERE document_id = ?
+            """,
+            (document_id,),
+        ).fetchone()
 
     chunk_payloads: list[dict[str, Any]] = []
     for chunk in chunks:
@@ -410,6 +482,7 @@ def _fetch_document_payload(
 
     return {
         "document": {key: document[key] for key in document.keys()},
+        "summary": _summary_row_to_payload(summary),
         "chunks": chunk_payloads,
     }
 
@@ -659,6 +732,48 @@ def create_app(
         except LLMClientError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return response.to_dict()
+
+    @app.post("/documents/{document_id}/summarize")
+    def summarize(
+        document_id: int,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        request_payload = payload or {}
+        force_value = request_payload.get("force", False)
+        if not isinstance(force_value, bool):
+            raise HTTPException(status_code=422, detail="force must be a boolean")
+        config, resolved_database_path = _resolve_config_and_database(
+            config_path=app.state.config_path,
+            database_path=app.state.database_path,
+        )
+        llm_client = getattr(app.state, "llm_client", None)
+        if llm_client is None:
+            llm_client = create_llm_client(config)
+        try:
+            summary = summarize_document(
+                document_id,
+                llm_client=llm_client,
+                database_path=resolved_database_path,
+                force=force_value,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "Document not found" in message else 400
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        except LLMClientError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return summary.to_dict()
+
+    @app.get("/documents/{document_id}/summary")
+    def get_summary(document_id: int) -> dict[str, Any]:
+        _config, resolved_database_path = _resolve_config_and_database(
+            config_path=app.state.config_path,
+            database_path=app.state.database_path,
+        )
+        summary = get_document_summary(document_id, database_path=resolved_database_path)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="Document summary not found")
+        return summary.to_dict()
 
     @app.get("/documents/{document_id}")
     def get_document(
